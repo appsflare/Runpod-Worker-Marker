@@ -5,7 +5,7 @@ description = "RunPod serverless worker for Marker PDF conversion"
 requires-python = ">=3.11"
 dependencies = [
     "runpod>=1.7.9",
-    "marker-pdf[full]>=1.7.4",
+    "marker-pdf[full]>=2.0.0",
     "torch>=2.2.2,<3.0.0",
     "torchvision>=0.17.0",
     "torchaudio>=2.2.0",
