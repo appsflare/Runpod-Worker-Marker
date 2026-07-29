@@ -3284,7 +3284,7 @@ wheels = [
 
 [[package]]
 name = "runpod-worker-marker"
-version = "0.1.0"
+version = "0.2.0"
 source = { virtual = "." }
 dependencies = [
     { name = "marker-pdf", extra = ["full"] },
@@ -3302,7 +3302,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "marker-pdf", extras = ["full"], specifier = ">=2.0.0" },
+    { name = "marker-pdf", extras = ["full"], specifier = ">=2.0.0,<2.1.0" },
     { name = "requests", specifier = ">=2.32.0" },
     { name = "runpod", specifier = ">=1.7.9" },
     { name = "torch", specifier = ">=2.2.2,<3.0.0", index = "https://download.pytorch.org/whl/cu130" },

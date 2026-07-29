@@ -31,7 +31,22 @@ def _stub(name, **attrs):
 
 # handler.py does `from marker.models import create_model_dict` at the top
 # level.  Stub only that symbol so the real marker package is otherwise intact.
-_fake_models = {"layout": MagicMock(), "ocr": MagicMock()}
+#
+# Under Marker 2.0 the returned dict is a set of thin clients rather than loaded
+# models, and one entry -- "inference_manager" -- owns the surya VLM server that
+# handler.ensure_inference_server() starts.  Its start() is mocked to succeed:
+# these tests cover handler routing, not inference, and there is no llama-server
+# on a dev box.
+_fake_inference_manager = MagicMock()
+_fake_inference_manager.method = "llamacpp"
+_fake_inference_manager.start.return_value = MagicMock()
+_fake_models = {
+    "inference_manager": _fake_inference_manager,
+    "layout_model": MagicMock(),
+    "fast_layout_model": MagicMock(),
+    "recognition_model": MagicMock(),
+    "ocr_error_model": MagicMock(),
+}
 import marker.models as _real_marker_models  # noqa: E402  (real package from .venv)
 _orig_create_model_dict = _real_marker_models.create_model_dict
 _real_marker_models.create_model_dict = lambda: _fake_models
@@ -214,7 +229,11 @@ class TestHandlerRouting(unittest.TestCase):
         as a valid llm_service path and complete a conversion successfully.
         """
         fake_rendered = MagicMock()
-        fake_rendered.metadata = {"page_stats": [{}]}
+        # block_counts must be non-empty: the handler treats "no blocks on any
+        # page" as a failed conversion (see TestEmptyResultGuard).
+        fake_rendered.metadata = {
+            "page_stats": [{"page_id": 0, "block_counts": [["Text", 2]]}]
+        }
         fake_converter = MagicMock(return_value=fake_rendered)
 
         fake_parser = MagicMock()
@@ -262,6 +281,155 @@ class TestHandlerRouting(unittest.TestCase):
         })
         self.assertFalse(result.get("success"))
         self.assertIn("llm_config", result.get("error", ""))
+
+
+# ---------------------------------------------------------------------------
+# Tests: Marker 2.0 conversion config
+# ---------------------------------------------------------------------------
+
+class TestConversionConfig(unittest.TestCase):
+    """Cover what the handler puts into Marker's config dict.
+
+    Marker 2.0 added a `mode` option selecting between the VLM path (balanced)
+    and the lightweight rf-detr path (fast), so the handler now exposes and
+    validates it.
+    """
+
+    def _config_for(self, job_input: dict) -> dict:
+        """Run a mocked conversion and return the config handed to ConfigParser."""
+        fake_rendered = MagicMock()
+        # block_counts must be non-empty: the handler treats "no blocks on any
+        # page" as a failed conversion (see TestEmptyResultGuard).
+        fake_rendered.metadata = {
+            "page_stats": [{"page_id": 0, "block_counts": [["Text", 2]]}]
+        }
+
+        fake_parser = MagicMock()
+        fake_parser.generate_config_dict.return_value = {}
+        fake_parser.get_processors.return_value = []
+        fake_parser.get_renderer.return_value = MagicMock()
+        fake_parser.get_llm_service.return_value = None
+
+        parser_cls = MagicMock(return_value=fake_parser)
+
+        with patch("marker.config.parser.ConfigParser", parser_cls), \
+             patch("marker.converters.pdf.PdfConverter",
+                   return_value=MagicMock(return_value=fake_rendered)), \
+             patch("marker.output.text_from_rendered", return_value=("# Hi", {}, {})):
+            result = _handler_mod.handler({"input": {
+                "pdf": "dGVzdA==",
+                "filename": "test.pdf",
+                **job_input,
+            }})
+
+        self.assertTrue(result.get("success"), msg=f"handler failed: {result}")
+        parser_cls.assert_called_once()
+        return parser_cls.call_args[0][0]
+
+    def test_mode_omitted_is_left_to_marker(self):
+        # PdfConverter defaults by device (balanced on CUDA); the handler must not
+        # pre-empt that with a hardcoded value.
+        self.assertNotIn("mode", self._config_for({}))
+
+    def test_mode_passed_through(self):
+        self.assertEqual(self._config_for({"mode": "fast"})["mode"], "fast")
+
+    def test_invalid_mode_rejected(self):
+        result = _handler_mod.handler({"input": {
+            "pdf": "dGVzdA==",
+            "filename": "test.pdf",
+            "mode": "turbo",
+        }})
+        self.assertFalse(result.get("success"))
+        self.assertIn("mode", result.get("error", ""))
+
+    def test_llm_config_ignored_when_use_llm_false(self):
+        # llm_config is documented as service-specific. Splatting it
+        # unconditionally let any caller write arbitrary top-level Marker config.
+        config = self._config_for({
+            "use_llm": False,
+            "llm_config": {"mode": "fast", "pdftext_workers": 99},
+        })
+        self.assertNotIn("mode", config)
+        self.assertNotIn("pdftext_workers", config)
+
+    def test_llm_config_merged_when_use_llm_true(self):
+        config = self._config_for({
+            "use_llm": True,
+            "llm_service": "openai_service.OpenAIServiceWithExtraBody",
+            "llm_config": {"openai_model": "some-model"},
+        })
+        self.assertEqual(config["openai_model"], "some-model")
+
+    def test_explicit_mode_wins_over_llm_config(self):
+        config = self._config_for({
+            "mode": "balanced",
+            "use_llm": True,
+            "llm_service": "openai_service.OpenAIServiceWithExtraBody",
+            "llm_config": {"mode": "fast"},
+        })
+        self.assertEqual(config["mode"], "balanced")
+
+    def test_null_llm_config_does_not_crash(self):
+        # Callers may send an explicit JSON null rather than omitting the key.
+        config = self._config_for({
+            "use_llm": True,
+            "llm_service": "openai_service.OpenAIServiceWithExtraBody",
+            "llm_config": None,
+        })
+        self.assertEqual(config["use_llm"], True)
+
+
+# ---------------------------------------------------------------------------
+# Tests: empty-result guard
+# ---------------------------------------------------------------------------
+
+class TestEmptyResultGuard(unittest.TestCase):
+    """Marker swallows per-page inference failures and still renders a valid but
+    empty document, so a total backend failure would otherwise be reported as a
+    successful conversion of nothing."""
+
+    def _run_with_page_stats(self, page_stats, markdown="# Hi"):
+        fake_rendered = MagicMock()
+        fake_rendered.metadata = {"page_stats": page_stats}
+
+        fake_parser = MagicMock()
+        fake_parser.generate_config_dict.return_value = {}
+        fake_parser.get_processors.return_value = []
+        fake_parser.get_renderer.return_value = MagicMock()
+        fake_parser.get_llm_service.return_value = None
+
+        with patch("marker.config.parser.ConfigParser", return_value=fake_parser), \
+             patch("marker.converters.pdf.PdfConverter",
+                   return_value=MagicMock(return_value=fake_rendered)), \
+             patch("marker.output.text_from_rendered", return_value=(markdown, {}, {})):
+            return _handler_mod.handler({"input": {
+                "pdf": "dGVzdA==",
+                "filename": "test.pdf",
+                "output_format": "markdown",
+            }})
+
+    def test_all_pages_empty_is_a_failure(self):
+        result = self._run_with_page_stats(
+            [{"page_id": 0, "block_counts": []}, {"page_id": 1, "block_counts": []}],
+            markdown="",
+        )
+        self.assertFalse(result.get("success"))
+        self.assertIn("no content", result.get("error", ""))
+
+    def test_some_content_still_succeeds(self):
+        result = self._run_with_page_stats([
+            {"page_id": 0, "block_counts": []},
+            {"page_id": 1, "block_counts": [["Text", 3]]},
+        ])
+        self.assertTrue(result.get("success"), msg=f"handler failed: {result}")
+        self.assertEqual(result["page_count"], 2)
+
+    def test_missing_page_stats_does_not_trip_the_guard(self):
+        # An empty page_stats list means "no pages reported", not "empty result" -
+        # don't turn that into a spurious failure.
+        result = self._run_with_page_stats([])
+        self.assertTrue(result.get("success"), msg=f"handler failed: {result}")
 
 
 if __name__ == "__main__":

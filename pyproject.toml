@@ -5,7 +5,11 @@ description = "RunPod serverless worker for Marker PDF conversion"
 requires-python = ">=3.11"
 dependencies = [
     "runpod>=1.7.9",
-    "marker-pdf[full]>=2.0.0",
+    # Upper bound is deliberate. marker 2.0 replaced in-process torch models with
+    # a VLM served over HTTP (surya>=0.22); an unpinned major bump changes the
+    # inference architecture out from under the Dockerfile. uv.lock is the real
+    # pin -- this is the backstop for when someone regenerates it.
+    "marker-pdf[full]>=2.0.0,<2.1.0",
     "torch>=2.2.2,<3.0.0",
     "torchvision>=0.17.0",
     "torchaudio>=2.2.0",
